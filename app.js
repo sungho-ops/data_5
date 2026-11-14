@@ -1,0 +1,357 @@
+let loadedYear=null;
+const $=id=>document.getElementById(id);
+const fmt=x=>Number(x).toLocaleString('ko-KR',{maximumFractionDigits:3});
+let worker, nextId=0, requests=new Map(), sectors=[], rowChoices=[], cells=[], basket=[], result=null;
+let linkageData=[];
+const LINKAGE_THRESHOLD=1.0;
+function text(tag,value){const e=document.createElement(tag);e.textContent=value;return e;}
+function call(type,payload){return new Promise((resolve,reject)=>{const id=++nextId;requests.set(id,{resolve,reject});worker.postMessage({id,type,payload});});}
+function startWorker(){worker=new Worker('./worker.js');worker.onmessage=({data:d})=>{if(d.type==='status'){if($('status'))$('status').textContent=d.text;return;}const p=requests.get(d.id);if(!p)return;requests.delete(d.id);d.ok?p.resolve(d.result):p.reject(Error(d.error));};worker.onerror=e=>{for(const p of requests.values())p.reject(Error(e.message||'Worker 실행 오류'));requests.clear();};}
+function options(el,list){if(!el)return;el.replaceChildren(...list.map(x=>{const o=document.createElement('option');o.value=x.code;o.textContent=x.code+' '+x.name;return o;}));}
+function invalidate(){result=null;if($('results'))$('results').hidden=true;}
+
+async function load(buffer){
+ invalidate();basket=[];renderBasket();
+ resetLinkageDisplay('새 연도 자료를 불러왔습니다. 자료 준비 후 연쇄효과를 분석하세요.');
+ for(const id of ['sheet','row','sector','add','run','row-search','col-search','sector-search','amount'])if($(id))$(id).disabled=true;
+ if(worker)worker.terminate();for(const p of requests.values())p.reject(Error('데이터 다시 로드'));requests.clear();startWorker();
+ try{const info=await call('init',buffer);sectors=info.sectors;options($('sector'),sectors);
+ if($('sector-search'))$('sector-search').value='';if($('row-search'))$('row-search').value='';if($('col-search'))$('col-search').value='';
+ if($('sheet'))$('sheet').replaceChildren(...info.sheets.map(s=>{const o=text('option',s);o.value=s;return o;}));
+ if($('validation'))$('validation').textContent=JSON.stringify(info.residuals,null,2)+'\n최대 절대 잔차: 허용값 1e-8 미만';
+ for(const id of ['sheet','row','sector','add','run','row-search','col-search','sector-search','amount'])if($(id))$(id).disabled=false;
+ await explore();if($('status'))$('status').textContent='준비 완료 · '+sectors.length+'개 부문 · '+info.sheets.length+'개 시트 · 계수 검증 통과';
+ }catch(e){if($('status'))$('status').textContent='준비 실패: '+e.message+' — 새로고침 후 재시도하세요.';}
+}
+
+let exploreSeq=0;
+async function explore(){
+  const seq=++exploreSeq;
+  try{
+    const d=await call('explore',{sheet:$('sheet')?$('sheet').value:'',row:$('row')?$('row').value:''});
+    if(seq!==exploreSeq)return;
+    rowChoices=d.rows;
+    filterRows(d.selected);
+    cells=d.cells;
+    // 이 부분이 문제의 원인이었습니다! 안전장치(if)를 추가하여 무조건 넘어갑니다.
+    if($('unit')) $('unit').textContent=d.unit;
+    if($('explore-caption')) $('explore-caption').textContent=($('sheet')?$('sheet').value:'')+' / 행: '+d.selected+' '+d.name;
+    renderCells();
+  }catch(e){
+    if($('status'))$('status').textContent=e.message;
+  }
+}
+
+function filterRows(selected){const q=$('row-search')?$('row-search').value.trim():'';options($('row'),rowChoices.filter(r=>(r.code+' '+r.name).includes(q)));if($('row')&&[...$('row').options].some(o=>o.value===selected))$('row').value=selected;}
+function renderCells(){const q=$('col-search')?$('col-search').value.trim():'';if($('cells'))$('cells').replaceChildren(...cells.filter(c=>(c.code+' '+c.name).includes(q)).map(c=>{const tr=document.createElement('tr');for(const v of [c.code,c.name,c.value===null?'빈 셀':typeof c.value==='number'?fmt(c.value):c.value])tr.append(text('td',v));return tr;}));}
+
+if($('sheet'))$('sheet').onchange=()=>{$('row-search').value='';$('row').replaceChildren();explore();};
+if($('row'))$('row').onchange=explore;
+if($('row-search'))$('row-search').oninput=()=>{filterRows();if($('row').value)explore();else{if($('cells'))$('cells').replaceChildren();if($('explore-caption'))$('explore-caption').textContent='일치하는 행이 없습니다.';}};
+if($('col-search'))$('col-search').oninput=renderCells;
+if($('sector-search'))$('sector-search').oninput=()=>{const q=$('sector-search').value.trim();options($('sector'),sectors.filter(s=>(s.code+' '+s.name).includes(q)));};
+
+function renderBasket(){if(!$('basket'))return;$('basket').replaceChildren(...basket.map((s,i)=>{const li=text('li',s.code+' '+s.name+' / '+fmt(s.amount)+'백만원 ');const b=text('button','삭제');b.type='button';b.onclick=()=>{basket.splice(i,1);invalidate();renderBasket();};li.append(b);return li;}));if($('sim-status'))$('sim-status').textContent=basket.length?basket.length+'개 입력 준비. 계산 버튼을 누르세요.':'시나리오를 추가하세요.';}
+if($('scenario'))$('scenario').onsubmit=e=>{e.preventDefault();const amount=Number($('amount').value),s=sectors.find(s=>s.code===$('sector').value);if(!s||!Number.isFinite(amount)||amount<=0){if($('sim-status'))$('sim-status').textContent='산업과 양의 증가액을 확인하세요.';return;}basket.push({...s,amount});invalidate();renderBasket();};
+if($('clear'))$('clear').onclick=()=>{basket=[];invalidate();renderBasket();};
+if($('run'))$('run').onclick=async()=>{if(!basket.length){if($('sim-status'))$('sim-status').textContent='시나리오를 먼저 추가하세요.';return;}const snapshot=basket.map(s=>({...s}));$('run').disabled=true;if($('sim-status'))$('sim-status').textContent='계산 중…';try{const r=await call('simulate',snapshot);if(JSON.stringify(snapshot)!==JSON.stringify(basket)){if($('sim-status'))$('sim-status').textContent='입력이 변경되었습니다. 다시 계산하세요.';return;}result=r;renderResult();if($('sim-status'))$('sim-status').textContent='계산 완료. 아래 결과는 현재 시나리오에 대응합니다.';}catch(e){invalidate();if($('sim-status'))$('sim-status').textContent='계산 실패: '+e.message;}finally{$('run').disabled=false;}};
+
+function renderResult(){if(!$('results'))return;$('results').hidden=false;if($('cards'))$('cards').replaceChildren(...[['수요 증가액',result.demand],['생산유발액',result.production],['수입유발액',result.imports],['부가가치유발액',result.valueAdded]].map(([title,v])=>{const d=text('div',title);d.className='card';d.append(text('strong',fmt(v)),text('span','백만원'));return d;}));const max=Math.max(...result.rows.map(r=>r.production),1);if($('bars'))$('bars').replaceChildren(...result.rows.slice(0,15).map(r=>{const d=text('div',r.name+' · '+fmt(r.production)+'백만원');d.className='bar';const t=document.createElement('div');t.className='track';const f=document.createElement('div');f.className='fill';f.style.width=Math.max(0,r.production/max*100)+'%';t.append(f);d.append(t);return d;}));if($('result-rows'))$('result-rows').replaceChildren(...result.rows.map(r=>{const tr=document.createElement('tr');[r.code,r.name,fmt(r.production),fmt(r.imports),fmt(r.valueAdded)].forEach(v=>tr.append(text('td',v)));return tr;}));}
+function csvCell(v){let s=String(v);if(/^[=+@-]/.test(s)&&typeof v!=='number')s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
+if($('download'))$('download').onclick=()=>{if(!result)return;const rows=[['산업코드','산업명','생산유발액_백만원','수입유발액_백만원','부가가치유발액_백만원'],...result.rows.map(r=>[r.code,r.name,r.production,r.imports,r.valueAdded])];const url=URL.createObjectURL(new Blob(['\ufeff'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='io-'+(loadedYear||'results')+'-results.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+
+async function loadSelectedWorkbook(year){
+  try {
+    if($('status'))$('status').textContent=`${year}년 기본 Excel 내려받는 중...`;
+    const response=await fetch(`./data/io-${year}.xlsx`);
+    if(!response.ok)throw Error(`${year}년 Excel 다운로드 실패 (HTTP `+response.status+')');
+    loadedYear=String(year);
+    await load(await response.arrayBuffer());
+  }catch(error){
+    if($('status'))$('status').textContent='준비 실패: '+error.message+' - 연결 상태를 확인하고 새로고침하세요.';
+    throw error;
+  }
+}
+
+if($('load-basic'))$('load-basic').onclick=async()=>{
+  const button=$('load-basic');
+  const selectedYear = document.getElementById('year-select').value;
+  button.disabled=true;
+  button.textContent='불러오는 중...';
+  try {
+    await loadSelectedWorkbook(selectedYear);
+    const ready=!$('sheet').disabled;
+    button.textContent=ready?`${selectedYear}년 데이터 불러오기 완료`:'기본부문 다시 불러오기';
+    button.disabled=ready;
+    if(ready && $('row')) $('row').dispatchEvent(new Event('change'));
+  }catch(e){
+  }finally{
+    if($('sheet') && $('sheet').disabled){button.disabled=false;button.textContent='기본부문 다시 불러오기';}
+  }
+};
+
+// 전방·후방 연쇄효과 필터 UI를 기존 페이지에 동적으로 추가합니다.
+// index.html을 수정하지 않아도 app.js 교체만으로 적용할 수 있습니다.
+function ensureLinkageFilterUI(){
+  const button=$('btn-linkage');
+  if(!button || $('linkage-filter')) return;
+
+  const wrap=document.createElement('div');
+  wrap.id='linkage-filter-wrap';
+  wrap.style.display='flex';
+  wrap.style.flexDirection='column';
+  wrap.style.alignItems='flex-start';
+  wrap.style.gap='6px';
+  wrap.style.margin='16px 0 4px';
+
+  const label=text('label','산업 유형 선택');
+  label.htmlFor='linkage-filter';
+  label.style.display='flex';
+  label.style.flexDirection='column';
+  label.style.gap='6px';
+  label.style.minWidth='min(100%, 320px)';
+
+  const select=document.createElement('select');
+  select.id='linkage-filter';
+  select.disabled=true;
+  select.style.width='min(100%, 360px)';
+  select.setAttribute('aria-label','연쇄효과 산업 유형 필터');
+  [
+    ['all','전체 산업'],
+    ['core','핵심 산업'],
+    ['backward','후방연쇄 선도 산업'],
+    ['forward','전방연쇄 선도 산업']
+  ].forEach(([value,labelText])=>{
+    const option=text('option',labelText);
+    option.value=value;
+    select.append(option);
+  });
+  label.append(select);
+
+  const summary=text('p','자료를 불러온 뒤 핵심 산업 분석을 실행하세요.');
+  summary.id='linkage-summary';
+  summary.className='note';
+  summary.setAttribute('role','status');
+  summary.style.margin='0';
+
+  wrap.append(label,summary);
+  button.insertAdjacentElement('afterend',wrap);
+  select.addEventListener('change',renderLinkageResults);
+}
+
+function setLinkageMessage(message){
+  const tbody=$('linkage-results');
+  if(!tbody)return;
+  const tr=document.createElement('tr');
+  const td=text('td',message);
+  td.colSpan=5;
+  td.className='empty-state';
+  tr.append(td);
+  tbody.replaceChildren(tr);
+}
+
+function resetLinkageDisplay(message='자료를 불러온 뒤 핵심 산업 분석을 실행하세요.'){
+  linkageData=[];
+  const filter=$('linkage-filter');
+  if(filter){filter.value='all';filter.disabled=true;}
+  if($('linkage-summary'))$('linkage-summary').textContent=message;
+  setLinkageMessage(message);
+}
+
+function updateLinkageFilterOptions(){
+  const filter=$('linkage-filter');
+  if(!filter)return;
+  const count=linkageData.length;
+  const core=linkageData.filter(x=>Number(x.backward)>=LINKAGE_THRESHOLD && Number(x.forward)>=LINKAGE_THRESHOLD).length;
+  const backward=linkageData.filter(x=>Number(x.backward)>=LINKAGE_THRESHOLD).length;
+  const forward=linkageData.filter(x=>Number(x.forward)>=LINKAGE_THRESHOLD).length;
+  const options=[
+    ['all',`전체 산업 (${count.toLocaleString('ko-KR')}개)`],
+    ['core',`핵심 산업 (${core.toLocaleString('ko-KR')}개)`],
+    ['backward',`후방연쇄 선도 산업 (${backward.toLocaleString('ko-KR')}개)`],
+    ['forward',`전방연쇄 선도 산업 (${forward.toLocaleString('ko-KR')}개)`]
+  ];
+  filter.replaceChildren(...options.map(([value,labelText])=>{
+    const option=text('option',labelText);
+    option.value=value;
+    return option;
+  }));
+  filter.value='all';
+  filter.disabled=false;
+}
+
+function renderLinkageResults(){
+  const tbody=$('linkage-results');
+  const filter=$('linkage-filter');
+  if(!tbody || !linkageData.length)return;
+
+  const selected=filter?filter.value:'all';
+  const visible=linkageData.filter(item=>{
+    const backward=Number(item.backward);
+    const forward=Number(item.forward);
+    if(selected==='core')return backward>=LINKAGE_THRESHOLD && forward>=LINKAGE_THRESHOLD;
+    if(selected==='backward')return backward>=LINKAGE_THRESHOLD;
+    if(selected==='forward')return forward>=LINKAGE_THRESHOLD;
+    return true;
+  });
+
+  // 후방 필터는 영향력 계수, 전방 필터는 감응도 계수 순으로 정렬합니다.
+  const sortKey=selected==='forward'?'forward':'backward';
+  visible.sort((a,b)=>Number(b[sortKey])-Number(a[sortKey]));
+
+  const summary=$('linkage-summary');
+  const categoryLabel={
+    all:'전체 산업',core:'핵심 산업',
+    backward:'후방연쇄 선도 산업',forward:'전방연쇄 선도 산업'
+  }[selected]||'전체 산업';
+  if(summary){
+    const year=loadedYear?loadedYear+'년 ':' ';
+    const criteria={
+      all:'전체 산업',
+      core:'영향력·감응도 계수 모두 1.000 이상',
+      backward:'영향력 계수 1.000 이상 · 핵심 산업 포함',
+      forward:'감응도 계수 1.000 이상 · 핵심 산업 포함'
+    }[selected]||'전체 산업';
+    summary.textContent=`${year}${categoryLabel}: ${visible.length.toLocaleString('ko-KR')}개 표시 · ${criteria}`;
+  }
+
+  if(!visible.length){
+    setLinkageMessage('선택한 조건에 해당하는 산업이 없습니다.');
+    return;
+  }
+
+  tbody.replaceChildren(...visible.map(item=>{
+    const tr=document.createElement('tr');
+    const backward=Number(item.backward);
+    const forward=Number(item.forward);
+    const isCore=backward>=LINKAGE_THRESHOLD && forward>=LINKAGE_THRESHOLD;
+    let note='—';
+    if(isCore){
+      note='⭐ 핵심 산업';
+      tr.style.backgroundColor='#e6f4ea';
+      tr.style.fontWeight='bold';
+    }else if(backward>=LINKAGE_THRESHOLD){
+      note='후방연쇄 선도';
+    }else if(forward>=LINKAGE_THRESHOLD){
+      note='전방연쇄 선도';
+    }
+    [item.code,item.name,backward.toFixed(3),forward.toFixed(3),note].forEach(value=>tr.append(text('td',value)));
+    return tr;
+  }));
+}
+
+ensureLinkageFilterUI();
+
+if($('btn-linkage'))$('btn-linkage').addEventListener('click',async()=>{
+  const btn=$('btn-linkage');
+  const filter=$('linkage-filter');
+  try{
+    btn.disabled=true;
+    btn.textContent='계산 중...';
+    if(filter)filter.disabled=true;
+    if($('linkage-summary'))$('linkage-summary').textContent='산업별 영향력·감응도 계수를 계산하고 있습니다.';
+    setLinkageMessage('데이터를 분석 중입니다...');
+
+    const data=await call('analyze_linkage');
+    if(!Array.isArray(data))throw Error('연쇄효과 결과 형식이 올바르지 않습니다.');
+    linkageData=data;
+    updateLinkageFilterOptions();
+    renderLinkageResults();
+  }catch(error){
+    console.error('연쇄효과 분석 중 오류:',error);
+    if(filter)filter.disabled=true;
+    if($('linkage-summary'))$('linkage-summary').textContent='연쇄효과 분석에 실패했습니다.';
+    setLinkageMessage('분석 실패: '+error.message);
+  }finally{
+    btn.disabled=false;
+    btn.textContent='핵심 산업 분석하기';
+    if(filter && linkageData.length)filter.disabled=false;
+  }
+});
+// 초기화 버튼 이벤트 (새로고침 없이 상태 리셋)
+if(document.getElementById('reset-app')) {
+  document.getElementById('reset-app').addEventListener('click', () => {
+    // 1. 불러오기 버튼 초기화
+    const loadBtn = document.getElementById('load-basic');
+    if(loadBtn) {
+      loadBtn.disabled = false;
+      loadBtn.textContent = '기본부문 불러오기';
+    }
+    
+    // 2. 화면의 표와 안내 문구 리셋
+    if($('sheet')) $('sheet').replaceChildren();
+    if($('row')) $('row').replaceChildren();
+    if($('cells')) $('cells').replaceChildren();
+    if($('explore-caption')) $('explore-caption').textContent = '기본 자료를 불러온 후 표시됩니다.';
+    if($('status')) $('status').textContent = '초기화되었습니다. 새로운 연도를 선택하고 불러오기를 눌러주세요.';
+    
+    // 3. 연쇄효과 결과와 필터 초기화
+    resetLinkageDisplay();
+
+    // 4. 시뮬레이션 장바구니 및 결과창 초기화
+    invalidate();
+    basket = [];
+    renderBasket();
+    
+    // 5. 하단 입력 필드 및 버튼들 비활성화 (초기 상태로 되돌림)
+    for(const id of ['sheet','row','sector','add','run','row-search','col-search','sector-search','amount']){
+      if($(id)) $(id).disabled = true;
+    }
+  });
+}
+// 4. 연도별 트렌드 분석 기능
+if(document.getElementById('run-trend')) {
+    // [버그 수정] 항목 갯수가 아닌, 초기 안내 문구가 있을 때만 복사하여 덮어쓰기 방지
+    const syncSectors = setInterval(() => {
+        if($('sector') && $('sector').options.length > 0 && $('trend-sector').options[0] && $('trend-sector').options[0].textContent.includes('먼저')) {
+            $('trend-sector').innerHTML = $('sector').innerHTML;
+            $('trend-sector').disabled = false;
+            if($('trend-search')) $('trend-search').disabled = false; // 검색창 활성화
+            $('run-trend').disabled = false;
+        }
+    }, 1000);
+
+    if($('trend-search')) {
+        $('trend-search').oninput = () => {
+            const q = $('trend-search').value.trim();
+            if(typeof sectors !== 'undefined' && sectors.length > 0) {
+                const filtered = sectors.filter(s => (s.code + ' ' + s.name).includes(q));
+                options($('trend-sector'), filtered);
+                
+                // 검색 결과가 있으면 첫 번째 항목을 자동으로 선택
+                if(filtered.length > 0) {
+                    $('trend-sector').selectedIndex = 0;
+                }
+            }
+        };
+    }
+
+    $('run-trend').onclick = async () => {
+        const btn=$('run-trend'), tbody=$('trend-results');
+        const sectorCode=$('trend-sector').value;
+        if(!sectorCode){tbody.textContent='산업을 먼저 선택하세요.';return;}
+        btn.disabled=true;$('trend-sector').disabled=true;$('trend-search').disabled=true;
+        // Use an isolated worker: never call load() or reset the main scenario.
+        const trendWorker=new Worker('./worker.js');
+        let counter=0; const pending=new Map();
+        function request(type,payload){return new Promise((resolve,reject)=>{const id=++counter;pending.set(id,{resolve,reject});trendWorker.postMessage({id,type,payload});});}
+        trendWorker.onmessage=({data:d})=>{if(d.type==='status')return;const p=pending.get(d.id);if(!p)return;pending.delete(d.id);d.ok?p.resolve(d.result):p.reject(Error(d.error));};
+        trendWorker.onerror=e=>{for(const p of pending.values())p.reject(Error(e.message||'트렌드 작업 오류'));pending.clear();};
+        tbody.replaceChildren();
+        try{
+            for(const year of ['2022','2023','2024']){
+                tbody.setAttribute('aria-label',year+'년 분석 중');
+                btn.textContent=year+'년 분석 중…';
+                const response=await fetch('./data/io-'+year+'.xlsx');
+                if(!response.ok)throw Error(year+'년 자료 HTTP '+response.status);
+                await request('init',await response.arrayBuffer());
+                const data=await request('analyze_linkage');
+                const target=data.find(x=>x.code===sectorCode);
+                const tr=document.createElement('tr');
+                const values=target?[year+'년',Number(target.backward).toFixed(3),Number(target.forward).toFixed(3),target.backward>=1&&target.forward>=1?'핵심산업':'']:[year+'년','자료 없음','자료 없음','해당 코드 없음'];
+                for(const v of values)tr.append(text('td',v));tbody.append(tr);
+            }
+        }catch(error){const tr=document.createElement('tr');const td=text('td','트렌드 분석 실패: '+error.message+' · 기존 시나리오와 데이터는 유지됩니다.');td.colSpan=4;tr.append(td);tbody.append(tr);}
+        finally{trendWorker.terminate();pending.clear();btn.disabled=false;btn.textContent='트렌드 분석하기';$('trend-sector').disabled=false;$('trend-search').disabled=false;tbody.removeAttribute('aria-label');}
+    };
+}
